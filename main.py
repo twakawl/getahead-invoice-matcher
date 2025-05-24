@@ -15,6 +15,14 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+# load dot_env file
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    logging.warning("dotenv module not found, skipping environment variable loading.")
+
 # Load settings
 with open("settings.json", "r") as f:
     settings = json.load(f)
@@ -123,7 +131,7 @@ class InvoiceMatcher:
                         total_amount.group(1)
                         .replace(",", ".")
                         .replace(" ", "")
-                        .replace("€","")
+                        .replace("€", "")
                     )
                     if total_amount
                     else None
@@ -158,7 +166,7 @@ class InvoiceMatcher:
                 "invoice_number": invoice_number.group(1) if invoice_number else None,
                 "total_amount": total_amount.group(1) if total_amount else None,
                 "receiver": receiver.group(1) if receiver else None,
-                "raw_text": text
+                "raw_text": text,
             }
         except Exception as e:
             logging.error(f"Error processing PDF {pdf_path}: {e}")
@@ -199,15 +207,13 @@ class InvoiceMatcher:
                 r"(?:Total Amount|Totaal|Totaalbedrag)[:\s]+([\d,]+\.\d{2})",
                 text,
             )
-            receiver = re.search(
-                r"(?:Receiver|Ontvanger)[:\s]+([\w\s]+)", text
-            )
+            receiver = re.search(r"(?:Receiver|Ontvanger)[:\s]+([\w\s]+)", text)
             logging.debug(f"Extracted text: {text}")
             return {
                 "invoice_number": invoice_number.group(1) if invoice_number else None,
                 "total_amount": total_amount.group(1) if total_amount else None,
                 "receiver": receiver.group(1) if receiver else None,
-                "text": text
+                "text": text,
             }
         except Exception as e:
             logging.error(f"Error processing PDF {pdf_path}: {e}")
@@ -242,20 +248,29 @@ class InvoiceMatcher:
         for invoice_data in self.extracted_data:
             # Initialize lists to store hits for each filter
             receiver_hits, amount_hits, iban_hits = [], [], []
-            
+
             # Filter on receiver
             receiver_match = tbd_rows[tbd_rows["Ontvanger"] == invoice_data["receiver"]]
-            logging.info(f"Receiver hits for {invoice_data['receiver']}: {len(receiver_match)}")
+            logging.info(
+                f"Receiver hits for {invoice_data['receiver']}: {len(receiver_match)}"
+            )
             receiver_hits.append(receiver_match)
 
             # Filter on total amount
-            amount_match = tbd_rows[tbd_rows["Totaal Bedrag"].astype(str) == str(invoice_data["total_amount"])]
-            logging.info(f"Total amount hits for {invoice_data['total_amount']}: {len(amount_match)}")
+            amount_match = tbd_rows[
+                tbd_rows["Totaal Bedrag"].astype(str)
+                == str(invoice_data["total_amount"])
+            ]
+            logging.info(
+                f"Total amount hits for {invoice_data['total_amount']}: {len(amount_match)}"
+            )
             amount_hits.append(amount_match)
 
             # Filter on IBAN
             if "iban" in invoice_data and invoice_data["iban"]:
-                iban_match = tbd_rows[tbd_rows["Betaling_Rekening"] == invoice_data["iban"]]
+                iban_match = tbd_rows[
+                    tbd_rows["Betaling_Rekening"] == invoice_data["iban"]
+                ]
                 logging.info(f"IBAN hits for {invoice_data['iban']}: {len(iban_match)}")
                 iban_hits.append(iban_match)
 
@@ -263,7 +278,9 @@ class InvoiceMatcher:
             combined_hits = pd.concat(
                 receiver_hits + amount_hits + iban_hits
             ).drop_duplicates()
-            logging.info(f"Total unique hits after combining filters: {len(combined_hits)}")
+            logging.info(
+                f"Total unique hits after combining filters: {len(combined_hits)}"
+            )
 
             # Process hits, if single match and update, if multiple write to a separate file, else warning
             if len(combined_hits) == 1:

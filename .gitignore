@@ -10,5 +10,7 @@ wheels/
 .venv
 
 # Input files
-input/
-output/
+
+# 
+.DS_Store
+.env
