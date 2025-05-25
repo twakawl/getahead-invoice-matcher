@@ -11,6 +11,18 @@ This guide explains how to set up and execute the invoice matcher script. Follow
 pip install uv
 ```
 
+3. **Tesseract OCR**: Required for OCR-based extraction.
+    - **macOS**: `brew install tesseract`
+    - **Linux**: `sudo apt install tesseract-ocr`
+    - **Windows**: Install from [UB Mannheim builds](https://github.com/UB-Mannheim/tesseract/wiki)
+
+4. **Poppler**: Required by `pdf2image`.
+    - **macOS**: `brew install poppler`
+    - **Linux**: `sudo apt install poppler-utils`
+    - **Windows**: [Poppler for Windows](http://blog.alivate.com.au/poppler-windows/)
+
+5. **OpenAI API Key**: Required if using GPT-based extraction.
+
 ---
 
 ## Step 1: Activating the UV Environment
@@ -25,25 +37,26 @@ This will automatically set up and activate the environment with all required de
 
 ---
 
-## Step 2: Configure Settings
+## Step 2: Configure Environment
 
-Create a `settings.json` file in the root directory with the following structure:
+Create a `.env` file in the root directory with the following:
 
-```json
-{
-    "input_excel": "path_to_input_excel.xlsx",
-    "output_excel": "path_to_output_excel.xlsx",
-    "pdf_directory": "path_to_pdf_directory",
-    "output_pdf_directory": "path_to_output_pdf_directory",
-    "extraction_method": "standard",  
-    "tesseract_path": "path_to_tesseract_executable",  
-    "openai_api_key": "your_openai_api_key"
-}
+```env
+OPENAI_API_KEY=your_openai_api_key
 ```
 
-- Replace `extraction_method` with one of the following: `standard`, `ocr`, or `gpt`.
-- Ensure paths are valid and accessible.
-- Add the OpenAI API key if using GPT-based extraction.
+Create a `settings.yaml` file in the root directory:
+
+```yaml
+input_path: "input"
+output_path: "output"
+input_excel: "betalingen_processed.csv"
+output_excel: "output.xlsx"
+pdf_directory: "invoices"
+output_pdf_directory: "invoices"
+extraction_method: "standard"  # Options: standard, ocr, gpt
+tesseract_path: "/opt/homebrew/bin/tesseract"  # Optional on macOS if not auto-detected
+```
 
 ---
 
@@ -52,26 +65,37 @@ Create a `settings.json` file in the root directory with the following structure
 Activate the environment using `uv activate` if not already activated, then run the script:
 
 ```bash
-python combined_invoice_matcher.py
+python main.py
 ```
 
 ---
 
 ## Additional Notes
 
-1. **PDF Dependencies**: The `pdf2image` package requires the `poppler-utils` library.
-    - **Linux**: `sudo apt install poppler-utils`
-    - **Mac**: `brew install poppler`
-    - **Windows**: Download [Poppler for Windows](http://blog.alivate.com.au/poppler-windows/).
-
-2. **Tesseract Installation**: Ensure `tesseract_path` is correctly set in `settings.json` if Tesseract is installed outside the default locations.
-
-3. **Permissions**: Ensure the script has access to read/write in the specified directories.
+1. **Token Estimation**: GPT-based extraction prints estimated token usage. High token counts may result in API errors.
+2. **GPT Cost Logging**: Token usage is logged and approximate USD cost is calculated per request.
+3. **OCR Path Override**: If your environment doesn't inherit `PATH`, the script explicitly sets Tesseract to `/opt/homebrew/bin/tesseract`.
+4. **Fallback Handling**: You can configure the script to try GPT → Standard → OCR if needed.
 
 ---
 
 ## Troubleshooting
 
 - **Missing Packages**: Run `uv install` to ensure all dependencies are installed.
-- **Tesseract Not Found**: Verify the `tesseract_path` is correctly set in `settings.json`.
-- **OpenAI Errors**: Ensure your API key is valid and your OpenAI usage quota is sufficient.
+- **Tesseract Not Found**: Ensure the correct path is set in the `.env` or within the script.
+- **Poppler Missing**: If you see `Unable to get page count`, install `poppler`.
+- **GPT Token Limits**: If you see HTTP 429 or "Request too large" errors, reduce PDF size or switch to text-based extraction.
+- **Rate Limits**: Monitor your [OpenAI usage dashboard](https://platform.openai.com/account/usage).
+
+---
+
+## Future Improvements
+
+- Upload files to OpenAI using Assistant API
+- Add retry logic and exponential backoff for GPT rate limits
+- Use PDF text extraction for GPT input to reduce token usage
+- Extend matching with fuzzy logic or NLP
+
+---
+
+Maintained by: Twan Houwers
