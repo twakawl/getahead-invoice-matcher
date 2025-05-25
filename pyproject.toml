@@ -13,4 +13,7 @@ dependencies = [
     "pillow>=11.1.0",
     "pypdf2>=3.0.1",
     "pytesseract>=0.3.13",
+    "python-dotenv>=1.1.0",
+    "pyyaml>=6.0.2",
+    "xlsxwriter>=3.2.3",
 ]

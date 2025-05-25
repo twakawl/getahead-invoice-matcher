@@ -1,39 +1,47 @@
 import os
 import re
-import json
 import logging
+from pathlib import Path
 from typing import Dict, Optional, List
 import pandas as pd
+import base64
+
+import yaml
+import json
+from dotenv import load_dotenv
 import pytesseract
 from PIL import Image
 from pdf2image import convert_from_path
 from PyPDF2 import PdfReader
-import openai
+from openai import OpenAI
+
 
 # Setup logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# load dot_env file
+# load .env file if present
 try:
-    from dotenv import load_dotenv
-
-    load_dotenv()
+    load_dotenv(".env")
+    logging.info("Loaded environment variables from .env file.")
 except ImportError:
     logging.warning("dotenv module not found, skipping environment variable loading.")
 
-# Load settings
-with open("settings.json", "r") as f:
-    settings = json.load(f)
+# Load settings from YAML
+with open("settings.yaml", "r") as f:
+    settings = yaml.safe_load(f)
 
-INPUT_EXCEL = settings["input_excel"]
-OUTPUT_EXCEL = settings["output_excel"]
-PDF_DIR = settings["pdf_directory"]
-OUTPUT_PDF_DIR = settings["output_pdf_directory"]
+INPUT_PATH = Path(settings.get("input_path", "input"))
+OUTPUT_PATH = Path(settings.get("output_path", "output"))
+INPUT_EXCEL = INPUT_PATH / settings["input_excel"]
+OUTPUT_EXCEL = OUTPUT_PATH / settings["output_excel"]
+PDF_DIR = INPUT_PATH / settings["pdf_directory"]
+OUTPUT_PDF_DIR = OUTPUT_PATH / settings["output_pdf_directory"]
 EXTRACTION_METHOD = settings["extraction_method"]  # Options: "standard", "ocr", "gpt"
 TESSERACT_PATH = settings.get("tesseract_path")  # Optional
-OPENAI_API_KEY = settings.get("openai_api_key")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # Optional, set in .env file
+
 
 # Configure Tesseract executable path if required
 if TESSERACT_PATH:
@@ -41,289 +49,296 @@ if TESSERACT_PATH:
 
 # Configure OpenAI API key if required
 if OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 class InvoiceMatcher:
-    def __init__(self, excel_path: str, pdf_dir: str, output_pdf_dir: str, method: str):
-        """
-        Initialize the InvoiceMatcher class.
 
-        Args:
-            excel_path (str): Path to the input Excel file.
-            pdf_dir (str): Directory containing the PDF files.
-            output_pdf_dir (str): Directory to store renamed PDF files.
-            method (str): Extraction method ("standard", "ocr", "gpt").
-        """
-        self.excel_path = excel_path
+    def __init__(
+        self, input_file: Path, pdf_dir: Path, output_pdf_dir: Path, method: str
+    ):
+        self.input_file = input_file
         self.pdf_dir = pdf_dir
         self.output_pdf_dir = output_pdf_dir
         self.method = method
-        self.data = self.load_excel()
+        self.data = self.load_input()
         self.extracted_data = []
-        self.all_combined_hits = pd.DataFrame()
+        self.matched_rows = []
+        self.uncertain_matches = []
+        self.unmatched_invoices = []
 
-    def load_excel(self) -> pd.DataFrame:
-        """Load the Excel file into a Pandas DataFrame."""
-        logging.info("Loading Excel file...")
-        df = pd.read_excel(self.excel_path)
-        df.columns = df.columns.str.strip()  # Clean column names
+    def load_input(self) -> pd.DataFrame:
+        logging.info(f"Loading Excel file from {self.input_file}")
+        df = pd.read_csv(self.input_file, sep=";", encoding="utf-8", decimal=",")
+        df.columns = df.columns.str.strip().str.lower()
+        logging.debug(f"Loaded columns: {df.columns.tolist()}")
         return df
 
-    def extract_invoice_data(self, pdf_path: str) -> Optional[Dict[str, str]]:
-        """
-        Extract invoice data from a PDF using the specified method.
-
-        Args:
-            pdf_path (str): Path to the PDF file.
-
-        Returns:
-            Optional[Dict[str, str]]: Extracted data containing "invoice_number", "total_amount", and "receiver".
-        """
+    def extract_invoice_data(self, pdf_path: Path) -> Optional[Dict[str, str]]:
         if self.method == "standard":
             return self.extract_standard(pdf_path)
         elif self.method == "ocr":
             return self.extract_ocr(pdf_path)
         elif self.method == "gpt":
             return self.extract_gpt(pdf_path)
+        elif self.method == "ocr_gpt":
+            return self.extract_ocr_gpt(pdf_path)
         else:
             logging.error(f"Unknown extraction method: {self.method}")
             return None
 
-    def extract_standard(self, pdf_path: str) -> Optional[Dict[str, str]]:
-        """
-        Extract invoice data using standard Python libraries.
-
-        Args:
-            pdf_path (str): Path to the PDF file.
-
-        Returns:
-            Optional[Dict[str, str]]: Extracted data containing "invoice_number", "total_amount", and "receiver".
-        """
-        logging.debug(f"Extracting data using standard method: {pdf_path}")
+    def extract_standard(self, pdf_path: Path) -> Optional[Dict[str, str]]:
+        logging.info(f"Extracting (standard) from: {pdf_path}")
         try:
-            reader = PdfReader(pdf_path)
-
-            # Extract text from all pages
+            reader = PdfReader(str(pdf_path))
             text = "\n".join(
                 page.extract_text() for page in reader.pages if page.extract_text()
             )
-            # extract spaces, keep newlines, all to lowercase
             text = re.sub(r" ", "", text).lower()
-            logging.debug(f"Extracted text: {text}")
-
-            # extract invoice number, total amount, and receiver
-            invoice_number = re.search(r"Invoice Number: (\d+)", text)
-
-            # Adjusted regex pattern (optional words, optional colon, optional spaces, optional currency symbol, thousand numbers and comma seperated)
-            total_amount_pattern = r"(?:totaal|totaalbedrag|factuurbedrag)(?:\:?)\s*€?\s*([\d,]+\.\d{2}|[\d,]+,\d{2})"
-            total_amount = re.search(total_amount_pattern, text)
-            logging.debug(f"Extracted total amount: {total_amount}")
-
-            # Extract IBAN
-            iban_pattern = r"[a-z]{2}\d{2}[a-z0-9]{4}\d{10}"
-            receiver = re.search(iban_pattern, text)
-
+            invoice_number = re.search(r"invoice\s*number[:\s]*(\d+)", text)
+            total_amount = re.search(
+                r"(?:totaal|totaalbedrag|factuurbedrag)[:\s]*€?\s*([\d,.]+)", text
+            )
+            receiver = re.search(r"[a-z]{2}\d{2}[a-z0-9]{4}\d{10}", text)
             return {
                 "invoice_number": invoice_number.group(1) if invoice_number else None,
                 "total_amount": (
-                    float(
-                        total_amount.group(1)
-                        .replace(",", ".")
-                        .replace(" ", "")
-                        .replace("€", "")
-                    )
+                    float(total_amount.group(1).replace(",", "."))
                     if total_amount
                     else None
                 ),
                 "receiver": receiver.group() if receiver else None,
+                "file_path": str(pdf_path),
             }
         except Exception as e:
-            logging.error(f"Error reading PDF {pdf_path}: {e}")
+            logging.error(f"Error during standard extraction: {e}")
             return None
 
-    def extract_ocr(self, pdf_path: str) -> Optional[Dict[str, str]]:
-        """
-        Extract invoice data using OCR.
+    def extract_ocr(self, pdf_path: Path) -> Optional[Dict[str, str]]:
+        logging.debug(f"Extracting (OCR) from: {pdf_path}")
+        pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
+        logging.info(
+            f"Using Tesseract from: {pytesseract.pytesseract.tesseract_cmd}, version: {pytesseract.get_tesseract_version()}"
+        )
 
-        Args:
-            pdf_path (str): Path to the PDF file.
-
-        Returns:
-            Optional[Dict[str, str]]: Extracted data containing "invoice_number", "total_amount", and "receiver".
-        """
-        logging.info(f"Extracting data using OCR: {pdf_path}")
         try:
-            images = convert_from_path(pdf_path)
-            text = " ".join(pytesseract.image_to_string(image) for image in images)
-            invoice_number = re.search(r"Invoice Number[:\s]+(\d+)", text)
+            images = convert_from_path(str(pdf_path))
+            text = "".join(pytesseract.image_to_string(image) for image in images)
+            text = re.sub(r" ", "", text).lower()
+            invoice_number = re.search(r"invoice\s*number[:\s]*(\d+)", text)
             total_amount = re.search(
-                r"(?:Total Amount|Totaal|Totaalbedrag)[:\s]+([\d,]+\.\d{2})", text
+                r"(?:totaal|totaalbedrag|factuurbedrag)[:\s]*€?\s*([\d,.]+)", text
             )
-            receiver = re.search(r"(?:Receiver|Ontvanger)[:\s]+([\w\s]+)", text)
-            logging.debug(f"Extracted text: {text}")
+            receiver = re.search(r"[a-z]{2}\d{2}[a-z0-9]{4}\d{10}", text)
             return {
                 "invoice_number": invoice_number.group(1) if invoice_number else None,
-                "total_amount": total_amount.group(1) if total_amount else None,
-                "receiver": receiver.group(1) if receiver else None,
-                "raw_text": text,
+                "total_amount": (
+                    float(total_amount.group(1).replace(",", "."))
+                    if total_amount
+                    else None
+                ),
+                "receiver": receiver.group() if receiver else None,
+                "file_path": str(pdf_path),
             }
         except Exception as e:
-            logging.error(f"Error processing PDF {pdf_path}: {e}")
+            logging.error(f"Error during OCR extraction: {e}")
             return None
 
-    def extract_gpt(self, pdf_path: str) -> Optional[Dict[str, str]]:
-        """
-        Extract invoice data using GPT-4.
+    def extract_gpt(self, pdf_path: Path) -> Optional[Dict[str, str]]:
+        logging.info(f"Extracting (GPT) from: {pdf_path}")
 
-        Args:
-            pdf_path (str): Path to the PDF file.
-
-        Returns:
-            Optional[Dict[str, str]]: Extracted data containing "invoice_number", "total_amount", and "receiver".
-        """
-        logging.info(f"Extracting data using GPT-4: {pdf_path}")
         try:
-            with open(pdf_path, "rb") as pdf_file:
-                pdf_content = pdf_file.read()
+            with open(pdf_path, "rb") as f:
+                pdf_bytes = f.read()
 
-            response = openai.ChatCompletion.create(
-                model="gpt-4-0613",
+            base64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
+
+            prompt = """Lees de inhoud van de PDF en extraheer de volgende gegevens:
+                        - Factuurnummer (bijv. factuurnummer, invoice number)
+                        - Totaal bedrag (vaak onderaan, bijv. totaal, totaal bedrag, total amount, factuurbedrag)
+                        - Ontvanger (IBAN), die volgt patroon [a-z]{2}\d{2}[a-z0-9]{4}\d{10}
+
+                        Geef de resultaten terug in JSON-formaat met de volgende structuur:
+                        1. invoice_number
+                        2. total_amount
+                        3. receiver
+                        Bij missende waarden, gebruik null
+
+                        Getallen kunnen komma's bevatten, dus converteer ze naar een float.
+                    """
+
+            response = openai_client.chat.completions.create(
+                model="gpt-4.1-mini",
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are an assistant that extracts structured data from invoice PDFs.",
+                        "content": "Jij bent een expert in het extraheren van factuurgegevens uit PDF's.",
                     },
                     {
                         "role": "user",
-                        "content": f"Extract the invoice number, total amount, and receiver from this PDF: {pdf_content}. Return all extracted text, end with the asked metrics.",
+                        "content": f"""{prompt} \n
+                        (PDF contents encoded in base64 below) \n
+                        {base64_pdf}""",
                     },
                 ],
             )
 
-            text = response.choices[0].message.content
-            invoice_number = re.search(r"Invoice Number[:\s]+(\d+)", text)
-            total_amount = re.search(
-                r"(?:Total Amount|Totaal|Totaalbedrag)[:\s]+([\d,]+\.\d{2})",
-                text,
+            # Print usage
+            usage = response.usage
+            logging.info(
+                f"Prompt tokens: {usage.prompt_tokens}, Completion tokens: {usage.completion_tokens}, Total: {usage.total_tokens}"
             )
-            receiver = re.search(r"(?:Receiver|Ontvanger)[:\s]+([\w\s]+)", text)
-            logging.debug(f"Extracted text: {text}")
+
+            result = response.choices[0].message.content
+            data = json.loads(result)
+            logging.info(f"Extracted data: {data}")
+
             return {
-                "invoice_number": invoice_number.group(1) if invoice_number else None,
-                "total_amount": total_amount.group(1) if total_amount else None,
-                "receiver": receiver.group(1) if receiver else None,
-                "text": text,
+                "invoice_number": data.get("invoice_number"),
+                "total_amount": (
+                    float(data.get("total_amount"))
+                    if data.get("total_amount")
+                    else None
+                ),
+                "receiver": data.get("receiver"),
+                "file_path": str(pdf_path),
             }
         except Exception as e:
-            logging.error(f"Error processing PDF {pdf_path}: {e}")
+            logging.error(f"Error during GPT extraction: {e}")
             return None
 
+    def extract_ocr_gpt(self, pdf_path: Path) -> Optional[Dict[str, str]]:
+        logging.info(f"Extracting (OCR + GPT) from: {pdf_path}")
+        pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
+        logging.debug(
+            f"Using Tesseract from: {pytesseract.pytesseract.tesseract_cmd}, version: {pytesseract.get_tesseract_version()}"
+        )
+
+        try:
+            # First, use OCR to extract text
+            images = convert_from_path(str(pdf_path))
+            text = "".join(pytesseract.image_to_string(image) for image in images)
+            text = re.sub(r" ", "", text).lower()
+
+            # Then, use GPT to extract structured data
+            prompt = """Lees de inhoud van de PDF en extraheer de volgende gegevens:
+                        - Factuurnummer (bijv. factuurnummer, invoice number)
+                        - Totaal bedrag (vaak onderaan, bijv. totaal, totaal bedrag, total amount, factuurbedrag)
+                        - Ontvanger (IBAN), die volgt patroon [a-z]{2}\d{2}[a-z0-9]{4}\d{10}
+
+                        Geef de resultaten terug in JSON-formaat met de volgende structuur:
+                        1. invoice_number (Factuurnummer)
+                        2. total_amount (Totaal bedrag)
+                        3. receiver (IBAN)
+                        Bij missende waarden, gebruik null
+
+                        Getallen kunnen komma's bevatten, dus converteer ze naar een float.
+                    """
+
+            response = openai_client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """
+                            Jij bent een expert in het extraheren van factuurgegevens uit PDF's. 
+                            Je bent erg secuur en neemt de tijd om een goede en gevalideerder JSON als output te geven.
+                            Je reageert in plain text, zonder markdown of andere opmaak. Dus geen ```json of dergelijke.
+                            Neem de tijd om de PDF goed te lezen en de juiste gegevens te extraheren.
+                            Kijk goed of je een IBAN kunt vinden, en of het totaal bedrag een getal is.
+                            """,
+                    },
+                    {
+                        "role": "user",
+                        "content": f"""{prompt} \n
+                        (PDF contents extracted via OCR) \n
+                        {text}""",
+                    },
+                ],
+            )
+        except Exception as e:
+            logging.error(f"Error during OCR + GPT extraction: {e}")
+            return None
+
+        # Print usage
+        usage = response.usage
+        logging.info(
+            f"Prompt tokens: {usage.prompt_tokens}, Completion tokens: {usage.completion_tokens}, Total: {usage.total_tokens}"
+        )
+
+        result = response.choices[0].message.content
+        logging.info(result)
+        data = json.loads(result)
+        logging.info(f"Extracted data: {data}")
+
+        return {
+            "invoice_number": data.get("invoice_number"),
+            "total_amount": (
+                float(data.get("total_amount")) if data.get("total_amount") else None
+            ),
+            "receiver": data.get("receiver"),
+            "file_path": str(pdf_path),
+        }
+
     def extract_all_data(self):
-        """
-        Extract data from all PDFs in the directory and save them in a list.
-        """
         logging.info("Extracting data from all PDFs...")
-        for pdf_file in os.listdir(self.pdf_dir):
-            pdf_path = os.path.join(self.pdf_dir, pdf_file)
-            invoice_data = self.extract_invoice_data(pdf_path)
-            if invoice_data:
-                invoice_data["file_path"] = pdf_path
-                self.extracted_data.append(invoice_data)
+        for pdf_file in self.pdf_dir.iterdir():
+            if pdf_file.suffix.lower() == ".pdf":
+                invoice_data = self.extract_invoice_data(pdf_file)
+                if invoice_data:
+                    self.extracted_data.append(invoice_data)
 
     def compare_and_update(self):
-        """
-        Compare extracted data with Excel file and update rows accordingly.
-        Filters the Excel file for matches on receiver, IBAN, and total amount,
-        logs the number of records per step, and processes hits.
-        """
-        logging.info("Comparing extracted data with Excel file...")
-        logging.debug(f"Extracted data: {self.extracted_data}")
+        logging.info("Comparing extracted invoices with Excel data...")
+        # receiver_col = "ontvanger"
+        iban_col = "iban betaald"
+        amount_col = "totaal bedrag"
 
-        # Filter rows where "Factuur op SP" is TBD
-        tbd_rows = self.data[self.data["Factuur op SP"].str.lower() == "tbd"]
-        logging.info(f"Initial rows to process (Factuur op SP = TBD): {len(tbd_rows)}")
-
-        # Iterate over extracted data from every invoice to filter Excel on potential matches
-        for invoice_data in self.extracted_data:
-            # Initialize lists to store hits for each filter
-            receiver_hits, amount_hits, iban_hits = [], [], []
-
-            # Filter on receiver
-            receiver_match = tbd_rows[tbd_rows["Ontvanger"] == invoice_data["receiver"]]
-            logging.info(
-                f"Receiver hits for {invoice_data['receiver']}: {len(receiver_match)}"
+        if iban_col not in self.data.columns or amount_col not in self.data.columns:
+            logging.error(
+                "Required columns 'ontvanger' or 'totaal bedrag' not found in Excel."
             )
-            receiver_hits.append(receiver_match)
+            return
 
-            # Filter on total amount
-            amount_match = tbd_rows[
-                tbd_rows["Totaal Bedrag"].astype(str)
-                == str(invoice_data["total_amount"])
+        for invoice in self.extracted_data:
+            iban = invoice.get("receiver")
+            amount = invoice.get("total_amount")
+            matches = self.data[
+                (self.data[iban_col] == iban)
+                & (self.data[amount_col].astype(float) == amount)
             ]
-            logging.info(
-                f"Total amount hits for {invoice_data['total_amount']}: {len(amount_match)}"
-            )
-            amount_hits.append(amount_match)
-
-            # Filter on IBAN
-            if "iban" in invoice_data and invoice_data["iban"]:
-                iban_match = tbd_rows[
-                    tbd_rows["Betaling_Rekening"] == invoice_data["iban"]
-                ]
-                logging.info(f"IBAN hits for {invoice_data['iban']}: {len(iban_match)}")
-                iban_hits.append(iban_match)
-
-            # Combine all hits into one DataFrame
-            combined_hits = pd.concat(
-                receiver_hits + amount_hits + iban_hits
-            ).drop_duplicates()
-            logging.info(
-                f"Total unique hits after combining filters: {len(combined_hits)}"
-            )
-
-            # Process hits, if single match and update, if multiple write to a separate file, else warning
-            if len(combined_hits) == 1:
-                logging.info("!!!!!!!!! Single match found for the extracted data.")
-                # row = combined_hits.iloc[0]
-
-                # new_invoice_number = (
-                #     max(self.data["Factuur_nummer"].dropna().astype(int), default=0) + 1
-                # )
-                # self.data.loc[row.name, "Factuur_nummer"] = new_invoice_number
-                # logging.info(
-                #     f"Matched and updated: {row['Factuur_nummer']} -> {new_invoice_number}"
-                # )
-
-                # new_pdf_name = f"Invoice_{new_invoice_number}.pdf"
-                # os.rename(
-                #     invoice_data["file_path"],
-                #     os.path.join(self.output_pdf_dir, new_pdf_name),
-                # )
-                # logging.info(
-                #     f"Renamed and saved: {invoice_data['file_path']} -> {new_pdf_name}"
-                # )
-            # Multiple matches found: log a warning
-            elif len(combined_hits) > 1:
-                # Add file name to the combined hits & store in all_combined_hits
-                combined_hits["Bestandsnaam"] = invoice_data["file_path"]
-                self.all_combined_hits = pd.concat(
-                    [combined_hits, self.all_combined_hits]
-                ).drop_duplicates()
-                logging.warning(
-                    f"Multiple matches found for the extracted data: {len(combined_hits)}"
-                )
-                logging.debug(combined_hits)
+            if len(matches) == 1:
+                logging.info(f"Single match found for invoice {invoice['file_path']}")
+                matched_row = matches.copy()
+                matched_row["source_file"] = invoice["file_path"]
+                self.matched_rows.append(matched_row)
+            elif len(matches) > 1:
+                logging.warning(f"Multiple matches for invoice {invoice['file_path']}")
+                uncertain = matches.copy()
+                uncertain["source_file"] = invoice["file_path"]
+                self.uncertain_matches.append(uncertain)
             else:
-                logging.warning("No matches found for the extracted data.")
+                logging.warning(f"No matches for invoice {invoice['file_path']}")
+                logging.warning(
+                    f"Invoice {invoice['file_path']} with receiver {iban} and amount {amount} not found in Excel."
+                )
+                self.unmatched_invoices.append(invoice)
 
     def save_results(self):
-        """
-        Save the updated Excel file.
-        """
-        logging.info("Saving updated Excel file...")
-        self.data.to_excel(OUTPUT_EXCEL, index=False)
-        self.all_combined_hits.to_excel("combined_hits.xlsx", index=False)
+        logging.info("Saving results to Excel...")
+        with pd.ExcelWriter(OUTPUT_EXCEL, engine="xlsxwriter") as writer:
+            if self.matched_rows:
+                pd.concat(self.matched_rows).to_excel(
+                    writer, sheet_name="Matches", index=False
+                )
+            if self.uncertain_matches:
+                pd.concat(self.uncertain_matches).to_excel(
+                    writer, sheet_name="Uncertain", index=False
+                )
+            if self.unmatched_invoices:
+                pd.DataFrame(self.unmatched_invoices).to_excel(
+                    writer, sheet_name="No Match", index=False
+                )
 
 
 if __name__ == "__main__":

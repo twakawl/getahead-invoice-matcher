@@ -1,0 +1,10 @@
+# Values 
+input_path: "input"
+output_path: "output"
+input_excel: "betalingen_processed.csv"
+output_excel: "output.xlsx"
+pdf_directory: "invoices"
+output_pdf_directory: "invoices"
+extraction_method: "ocr_gpt"  # Options: "standard","ocr","gpt", "ocr_gpt"
+tesseract_path: "/usr/bin/tesseract"  # Optional
+factuur_string: "factuurnummer|factuur nummer|factuur nr|factuur no|"
