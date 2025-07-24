@@ -8,3 +8,5 @@ extraction_method: "ocr_gpt"  # Options: "standard","ocr","gpt", "ocr_gpt"
 tesseract_path: "/usr/bin/tesseract"  # Optional
 factuur_string: "factuurnummer|factuur nummer|factuur nr|factuur no|"
 process_all: False  # If true, existing results in output_excel will be overwritten
+last_invoice_file: "last_invoice_number.txt"  # File to store the last processed invoice number
+process_all: True #! If true, existing results in output_excel will be overwritten
