@@ -12,7 +12,7 @@ from pdf2image import convert_from_path
 from dotenv import load_dotenv
 from openai import OpenAI
 from openpyxl import load_workbook
-from PIL import Image  # Add this import to use PIL for image opening
+from PIL import Image
 
 # Setup logging
 logging.basicConfig(
@@ -41,7 +41,6 @@ INVOICE_DIR = INPUT_PATH / settings.get("invoice_directory", None)
 EXTRACTION_METHOD = settings.get("extraction_method")  # Options: "ocr_gpt"
 TESSERACT_PATH = settings.get("tesseract_path")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-LAST_INVOICE_FILE = Path(settings.get("last_invoice_file", "last_invoice_number.txt"))
 
 
 # Configure Tesseract executable path if required
@@ -66,7 +65,7 @@ class InvoiceMatcher:
 
         self.data = self.load_input()
         self.extracted_data = []
-        self.matched_rows = []
+        self.processed_rows = []
         self.uncertain_matches = []
         self.unmatched_invoices = []
 
@@ -91,26 +90,14 @@ class InvoiceMatcher:
         # Make all directories if they do not exist
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def read_last_invoice_number(self) -> Optional[int]:
-        try:
-            with open(LAST_INVOICE_FILE, "r") as f:
-                value = int(f.read().strip())
-                logging.debug(f"Loaded last_invoice_number: {value}")
-                return value
-        except Exception as e:
-            logging.warning(f"Could not read last_invoice_number: {e}")
-            return None
-
-    def update_last_invoice_number(self, new_number: int):
-        try:
-            with open(LAST_INVOICE_FILE, "w") as f:
-                f.write(str(new_number))
-            logging.debug(f"Updated last_invoice_number to: {new_number}")
-        except Exception as e:
-            logging.error(f"Failed to update last_invoice_number: {e}")
+    def update_settings(self):
+        logging.debug("Updating settings.yaml")
+        with open("settings.yaml", "w", encoding="utf-8") as f:
+            yaml.dump(settings, f)
 
     def load_input(self) -> pd.DataFrame:
         logging.info(f"Loading CSV file from {self.input_file}")
+        logging.warning("This script is not idempotent. Re-running it on the same input file will result in duplicate entries and incorrect invoice numbers.")
         try:
             df = pd.read_csv(self.input_file, sep=";", encoding="utf-8", decimal=",")
             df.columns = df.columns.str.strip().str.lower()
@@ -211,7 +198,7 @@ class InvoiceMatcher:
                     {
                         "role": "system",
                         "content": """
-                            Jij bent een expert in het extraheren van factuurgegevens uit PDF's. 
+                            Jij bent een expert in het extraheren van factuurgegevens uit PDF's.
                             Je bent erg secuur en neemt de tijd om een goede en gevalideerder JSON als output te geven.
                             Je reageert in plain text, zonder markdown of andere opmaak. Dus geen ```json of dergelijke.
                             Neem de tijd om de PDF goed te lezen en de juiste gegevens te extraheren.
@@ -254,93 +241,87 @@ class InvoiceMatcher:
                 self.extracted_data.append(invoice_data)
 
     def compare_and_update(self):
-        logging.info("Comparing extracted invoices with Excel data...")
+        logging.info("Comparing input data with extracted invoices...")
         iban_col = "iban betaald"
         amount_col = "totaal bedrag"
 
         if iban_col not in self.data.columns or amount_col not in self.data.columns:
-            logging.error(
-                "Required columns 'ontvanger' or 'totaal bedrag' not found in Excel."
-            )
+            logging.error(f"Required columns '{iban_col}' or '{amount_col}' not found in input file.")
             return
 
-        for invoice in self.extracted_data:
-            iban = invoice.get("receiver")
-            amount = invoice.get("total_amount")
-            no_rows_total = len(self.data)
-            logging.debug(
-                f"Looking for invoice {invoice.get('file_path')} with receiver {iban} and amount {amount} in betalingen data with {no_rows_total} rows."
-            )
+        available_invoices = self.extracted_data.copy()
 
-            if iban is not None:
-                filtered_data = self.data[
-                    self.data[iban_col].str.lower() == iban.lower()
-                ]
-                logging.debug(
-                    f"Filtered data contains {len(filtered_data)} / {no_rows_total} rows for IBAN {iban}."
-                )
-                if not filtered_data.empty:
-                    filtered_data = filtered_data[
-                        filtered_data[amount_col].astype(float) == amount
-                    ]
-                    logging.debug(
-                        f"Filtered data contains {len(filtered_data)} / {no_rows_total} rows for amount {amount}."
+        invoice_number = settings.get("last_invoice_number", 0)
+
+        for index, row in self.data.iterrows():
+            invoice_number += 1
+            invoice_number_styled = f"F{invoice_number:04d}"
+
+            output_row = row.to_frame().T.copy()
+            output_row.insert(0, "ID", invoice_number_styled)
+
+            row_iban = row.get(iban_col)
+            row_amount = row.get(amount_col)
+
+            matching_invoices = []
+            if pd.notna(row_iban) and pd.notna(row_amount):
+                for invoice in available_invoices:
+                    invoice_iban = invoice.get("receiver")
+                    invoice_amount = invoice.get("total_amount")
+
+                    iban_match = (
+                        isinstance(row_iban, str) and
+                        isinstance(invoice_iban, str) and
+                        row_iban.lower() == invoice_iban.lower()
                     )
-            elif amount is not None:
-                filtered_data = self.data[self.data[amount_col].astype(float) == amount]
-                logging.info(
-                    f"Filtered data contains {len(filtered_data)} / {no_rows_total} rows for amount {amount} without IBAN."
-                )
-            else:
-                filtered_data = pd.DataFrame()
 
-            if len(filtered_data) == 1:
-                logging.info(f"Single match found for invoice {invoice['file_path']}")
-                matched_row = filtered_data.copy()
-                matched_row["file_path"] = invoice["file_path"]
+                    amount_match = pd.notna(invoice_amount) and abs(float(row_amount) - float(invoice_amount)) < 0.01
+
+                    if iban_match and amount_match:
+                        matching_invoices.append(invoice)
+
+            if len(matching_invoices) == 1:
+                matched_invoice = matching_invoices[0]
+                logging.info(f"Single match found for row {index} with invoice {matched_invoice['file_path']}")
+
+                output_row["file_path"] = matched_invoice["file_path"]
+                output_row["invoice_number"] = matched_invoice.get("invoice_number")
 
                 try:
-                    invoice_number = self.read_last_invoice_number()
-                    # Saving path and filename
-                    invoice_number_styled = f"F{invoice_number:04d}"
-                    new_file_name = (
-                        f"F{invoice_number:04d}{Path(invoice['file_path']).suffix}"
-                    )
+                    new_file_name = f"{invoice_number_styled}{Path(matched_invoice['file_path']).suffix}"
                     new_file_path = self.invoice_dir / new_file_name
-                    Path(invoice["file_path"]).rename(new_file_path)
-
-                    # Update the row for in the Excel file
-                    matched_row.insert(0, "ID", invoice_number_styled)
-
-                    # Update the last invoice number
-                    self.update_last_invoice_number(invoice_number + 1)
-                    logging.info(
-                        f"Renamed invoice file to {new_file_name} and updated last invoice number to {invoice_number_styled}"
-                    )
+                    Path(matched_invoice["file_path"]).rename(new_file_path)
+                    logging.info(f"Renamed invoice file to {new_file_name}")
                 except Exception as e:
-                    logging.error(f"Failed to rename or track invoice file: {e}")
-                    matched_row.insert(0, "new_file_name", "<rename_failed>")
+                    logging.error(f"Failed to rename invoice file: {e}")
+                    output_row["file_path"] = "<rename_failed>"
 
-                self.matched_rows.append(matched_row)
+                available_invoices.remove(matched_invoice)
+                self.processed_rows.append(output_row)
 
-            elif len(filtered_data) > 1:
-                logging.warning(f"Multiple matches for invoice {invoice['file_path']}")
-                uncertain = filtered_data.copy()
-                uncertain["file_path"] = invoice["file_path"]
-                uncertain["invoice_number"] = invoice["invoice_number"]
-                self.uncertain_matches.append(uncertain)
-            else:
-                logging.warning(f"No matches for invoice {invoice['file_path']}")
-                logging.warning(
-                    f"Invoice {invoice['file_path']} with receiver {iban} and amount {amount} not found in Excel."
-                )
-                self.unmatched_invoices.append(invoice)
+            elif len(matching_invoices) > 1:
+                logging.warning(f"Multiple matches for row {index}")
+                output_row["file_path"] = ", ".join([inv["file_path"] for inv in matching_invoices])
+                output_row["invoice_number"] = ", ".join([str(inv.get("invoice_number", '')) for inv in matching_invoices])
+                self.uncertain_matches.append(output_row)
+                for inv in matching_invoices:
+                    if inv in available_invoices:
+                        available_invoices.remove(inv)
+            else: # No match
+                logging.warning(f"No match found for row {index}")
+                output_row["file_path"] = ""
+                output_row["invoice_number"] = ""
+                self.processed_rows.append(output_row)
+
+        settings["last_invoice_number"] = invoice_number
+
+        self.unmatched_invoices = available_invoices
 
     def save_results(self):
         logging.info("Saving results to Excel...")
         with pd.ExcelWriter(OUTPUT_EXCEL, engine="xlsxwriter") as writer:
-            if self.matched_rows:
-                pd.concat(self.matched_rows).to_excel(
+            if self.processed_rows:
+                pd.concat(self.processed_rows).to_excel(
                     writer, sheet_name="Matches", index=False
                 )
             if self.uncertain_matches:
@@ -358,4 +339,5 @@ if __name__ == "__main__":
     matcher.extract_all_data()
     matcher.compare_and_update()
     matcher.save_results()
+    matcher.update_settings()
     logging.info("Invoice matching completed.")
