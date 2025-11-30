@@ -121,7 +121,6 @@ class InvoiceMatcher:
 
     def extract_ocr_gpt(self, invoice_file_path: Path) -> Optional[Dict[str, str]]:
         logging.info(f"Extracting (OCR + GPT) from: {invoice_file_path}")
-        pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
         logging.debug(
             f"Using Tesseract from: {pytesseract.pytesseract.tesseract_cmd}, version: {pytesseract.get_tesseract_version()}"
         )
@@ -169,9 +168,9 @@ class InvoiceMatcher:
             else:
                 logging.error(f"Unsupported file type: {invoice_file_path.suffix}")
                 return {
-                    "invoice_number": "onbkend",
-                    "total_amount": "onbkend",
-                    "receiver": "onbkend",
+                    "invoice_number": "onbekend",
+                    "total_amount": "onbekend",
+                    "receiver": "onbekend",
                     "file_path": str(invoice_file_path),
                 }
 
@@ -275,7 +274,10 @@ class InvoiceMatcher:
                         row_iban.lower() == invoice_iban.lower()
                     )
 
-                    amount_match = pd.notna(invoice_amount) and abs(float(row_amount) - float(invoice_amount)) < 0.01
+                    try:
+                        amount_match = pd.notna(invoice_amount) and abs(float(row_amount) - float(invoice_amount)) < 0.01
+                    except (ValueError, TypeError):
+                        amount_match = False
 
                     if iban_match and amount_match:
                         matching_invoices.append(invoice)
